@@ -21,9 +21,11 @@ cpuset":
   `open …/kata_<id>/cpuset.cpus: permission denied`. With the kubelet's static
   CPU manager, that is every container.
 - **The fix.** Before `UpdateCpuSet` writes `cpuset.cpus` or `cpuset.mems`
-  of the sandbox cgroup, it enables `cpuset` in the parent cgroup's
-  `cgroup.subtree_control` if the sandbox cgroup lacks it. It writes nothing
-  when `cpuset` is already enabled; for a cgroup managed by systemd it returns
+  of the sandbox cgroup, it checks the sandbox cgroup's `cgroup.controllers`.
+  If `cpuset` is missing, it writes `+cpuset` into the
+  `cgroup.subtree_control` of each ancestor, from the root cgroup down to the
+  parent, which changes nothing where `cpuset` is enabled already. It writes
+  nothing when `cpuset` is there; for a cgroup managed by systemd it returns
   a clear error instead of writing. The file is
   `src/runtime/pkg/resourcecontrol/cgroups.go`, with a regression test beside
   it.
@@ -50,8 +52,10 @@ On a Talos node with the extension built here:
 ## Upstream
 
 Nothing is opened upstream from this fork: no issue, pull request or comment.
-The fix commit is in upstream's format so that it can be cherry-picked as it
-is, should its owner decide to send it.
+The fix commit is in upstream's format, apart from the trailers that upstream
+requires: `Fixes: #<issue>`, `Signed-off-by:`, and `Generated-By:` or
+`Assisted-By:` under the OpenInfra AI policy. Its owner adds them before
+sending it, should they decide to.
 
 How this fork's CI runs, what it costs and how to release is in
 [.github/FORK-CI.md](.github/FORK-CI.md).
