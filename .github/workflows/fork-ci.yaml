@@ -18,6 +18,8 @@
 #              root, which must pass; reverses the fix outside the tests and
 #              runs it again, which must fail with the bug's error; runs the
 #              package's tests as root and as the runner user
+#   preflight  with push only, before the build: checks that the version does
+#              not exist on ghcr.io yet
 #   extension  builds the extension the way siderolabs/extensions v1.14.6
 #              does, with the fix added as a patch, and compares the image
 #              with the official one file by file
@@ -75,6 +77,13 @@ env:
   OFFICIAL_IMAGE: "ghcr.io/siderolabs/kata-containers@sha256:dfd94e726b0ca516c198881c296d2f2fbce75ceb97244f3c1bdbba065bafd23e"
   OFFICIAL_AMD64_MANIFEST: "sha256:fb31f84fb60a74fb96a20cdd24078350c25a8e29e780cce638e04599ff431d18"
   BUILDKIT_IMAGE: "moby/buildkit:buildx-stable-1@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe"
+  # The images Sidero's build pulls by tag (Pkgfile's frontend, the tools
+  # image, the validator), with what the tags resolved to on 2026-11-13. The
+  # build stops if a tag has moved since; the control build shows whether
+  # these reproduce the official shim.
+  SIDERO_BLDR_PIN: "ghcr.io/siderolabs/bldr:v0.6.5@sha256:907afdb24203332eb88ac540659479d3ebf0f52d0c35d91d013473163936865e"
+  SIDERO_TOOLS_PIN: "ghcr.io/siderolabs/tools:v1.14.0-12-g5959f76@sha256:7da814b599938db6e31a9e1354f074acab12c541ef290abf6d3628f18179e939"
+  SIDERO_VALIDATOR_PIN: "ghcr.io/siderolabs/extensions-validator:c0c37e7@sha256:3737c0e2f22e66382bddcdaab61e305eae453913ad3ba9b6096e96647daae800"
   # Use the Go that setup-go installs, never download another one.
   GOTOOLCHAIN: "local"
 
@@ -254,10 +263,45 @@ jobs:
           fi
           echo "Package tests as root and as the runner user: passed." >> "${GITHUB_STEP_SUMMARY}"
 
+  preflight:
+    name: "preflight: the version is free on ghcr.io"
+    if: ${{ inputs.extension == 'push' }}
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 5
+    # The same permission as publish, so that the registry answers the same.
+    # No third-party code runs here.
+    permissions:
+      packages: write
+    steps:
+      - name: "Log in to ghcr.io"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: printf '%s' "${GITHUB_TOKEN}" | skopeo login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: "Refuse to overwrite an existing version"
+        run: |
+          ref="${EXTENSION_IMAGE}:${EXTENSION_VERSION}"
+          if out=$(skopeo inspect --raw "docker://${ref}" 2>&1); then
+            echo "::error::${ref} exists already; bump EXTENSION_VERSION instead"
+            exit 1
+          fi
+          case "${out}" in
+            *"manifest unknown"*|*"MANIFEST_UNKNOWN"*|*"name unknown"*|*"NAME_UNKNOWN"*|*"not found"*) echo "${ref} does not exist yet" ;;
+            *) echo "::error::cannot tell whether ${ref} exists: ${out}"; exit 1 ;;
+          esac
+
+      - name: "Log out of ghcr.io"
+        if: ${{ always() }}
+        run: skopeo logout ghcr.io || true
+
   extension:
     name: "extension: build and compare with the official image"
-    needs: test
-    if: ${{ inputs.extension == 'build' || inputs.extension == 'push' }}
+    needs: [test, preflight]
+    if: >-
+      ${{ !cancelled()
+      && needs.test.result == 'success'
+      && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped')
+      && (inputs.extension == 'build' || inputs.extension == 'push') }}
     runs-on: "ubuntu-24.04"
     timeout-minutes: 45
     outputs:
@@ -325,6 +369,12 @@ jobs:
             echo "::error::ref changes nothing in src/"
             exit 1
           fi
+          # Only the Go shim is built from source; everything else comes from
+          # the kata-go-static tarball, so a change elsewhere would not ship.
+          if outside=$(git -C kata diff --name-only "${BASE_COMMIT}" HEAD -- src/ | grep -v '^src/runtime/'); then
+            echo "::error::ref changes files the extension does not build from source: ${outside}"
+            exit 1
+          fi
           python3 -I - "${recipe}" <<'EOF'
           import os
           import sys
@@ -352,12 +402,25 @@ jobs:
           git -C ext status --short
           cp "${recipe}/patches/dusk-to-dawn-fixes.patch" "${RUNNER_TEMP}/comparison/"
 
+      - name: "Check that the images Sidero's build pulls by tag have not moved"
+        run: |
+          for pin in "${SIDERO_BLDR_PIN}" "${SIDERO_TOOLS_PIN}" "${SIDERO_VALIDATOR_PIN}"; do
+            tag=${pin%@*} want=${pin#*@}
+            got="sha256:$(skopeo inspect --no-creds --raw "docker://${tag}" | sha256sum | cut -d' ' -f1)"
+            if [[ "${got}" != "${want}" ]]; then
+              echo "::error::${tag} now resolves to ${got}, not ${want}"
+              exit 1
+            fi
+            echo "${tag} = ${want}"
+          done
+
       - name: "Set up Docker Buildx"
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=${{ env.BUILDKIT_IMAGE }}
 
       - name: "Build the extension with the fix (linux/amd64)"
+        id: build
         working-directory: ext
         run: |
           make docker-kata-containers PLATFORM=linux/amd64 PROGRESS=plain \
@@ -383,14 +446,16 @@ jobs:
 
           Both arguments are OCI image layouts holding one linux/amd64 image manifest.
           Every blob is checked against its digest. Layers are applied in order, with
-          OCI whiteouts. Each file is listed with its type, mode and sha256 (or link
-          target) into <out dir>/{official,candidate}-files.tsv, and the differences
-          into <out dir>/comparison.md.
+          OCI whiteouts. Each file is listed with its type, mode, sha256 (or link
+          target) and owner (uid:gid and extended attributes) into
+          <out dir>/{official,candidate}-files.tsv, and the differences into
+          <out dir>/comparison.md.
 
           strict: fail unless the file lists are equal, the only files that differ are
-          the shim and the extension manifest, the shim differs, the candidate shim
-          holds FIX_MARKER and the official one does not, and the candidate manifest
-          equals the official one with metadata.version set to EXTENSION_VERSION.
+          the shim and the extension manifest, the shim differs but keeps its type,
+          mode and owner, the candidate shim holds FIX_MARKER and the official one
+          does not, and the candidate manifest equals the official one with
+          metadata.version set to EXTENSION_VERSION.
           report: write the same report and never fail on differences.
           """
           import gzip
@@ -453,25 +518,28 @@ jobs:
                                   del files[p]
                               continue
                           mode = f"{m.mode:04o}"
+                          # Ownership and extended attributes (file capabilities, ACLs) count too.
+                          owner = f"{m.uid}:{m.gid}" + "".join(
+                              f" {k}={v!r}" for k, v in sorted(m.pax_headers.items()) if ".xattr." in k)
                           if m.isreg():
                               content = tar.extractfile(m).read()
-                              files[path] = ("file", mode, hashlib.sha256(content).hexdigest())
+                              files[path] = ("file", mode, hashlib.sha256(content).hexdigest(), owner)
                               if path in (SHIM, MANIFEST):
                                   keep[path] = content
                           elif m.isdir():
-                              files[path] = ("dir", mode, "-")
+                              files[path] = ("dir", mode, "-", owner)
                           elif m.issym():
-                              files[path] = ("symlink", mode, m.linkname)
+                              files[path] = ("symlink", mode, m.linkname, owner)
                           elif m.islnk():
-                              files[path] = ("hardlink", mode, m.linkname)
+                              files[path] = ("hardlink", mode, m.linkname, owner)
                           else:
-                              files[path] = (f"type-{m.type!r}", mode, "-")
+                              files[path] = (f"type-{m.type!r}", mode, f"{m.devmajor}:{m.devminor}", owner)
               return desc["digest"], files, keep
 
 
           def write_tsv(path, files):
               with open(path, "w") as f:
-                  f.write("path\ttype\tmode\tsha256-or-target\n")
+                  f.write("path\ttype\tmode\tsha256-or-target\towner\n")
                   for p in sorted(files):
                       f.write("\t".join((p,) + files[p]) + "\n")
 
@@ -489,8 +557,8 @@ jobs:
               only_official = sorted(set(of) - set(cf))
               only_candidate = sorted(set(cf) - set(of))
               differ = sorted(p for p in set(of) & set(cf) if of[p] != cf[p])
-              shim_o = of.get(SHIM, ("", "", "missing"))[2]
-              shim_c = cf.get(SHIM, ("", "", "missing"))[2]
+              shim_o = of.get(SHIM, ("", "", "missing", ""))[2]
+              shim_c = cf.get(SHIM, ("", "", "missing", ""))[2]
 
               problems = []
               if only_official or only_candidate:
@@ -500,8 +568,8 @@ jobs:
                   problems.append("files other than the shim and the manifest differ: " + ", ".join(unexpected))
               if SHIM not in of or SHIM not in cf:
                   problems.append("the shim is missing")
-              elif of[SHIM][:2] != cf[SHIM][:2]:
-                  problems.append("the shim's type or mode differs")
+              elif of[SHIM][:2] != cf[SHIM][:2] or of[SHIM][3] != cf[SHIM][3]:
+                  problems.append("the shim's type, mode or ownership differs")
               if shim_o == shim_c:
                   problems.append("the shim does not differ")
               marker = os.environ.get("FIX_MARKER", "").encode()
@@ -568,8 +636,10 @@ jobs:
           fi
           echo "digest=$(jq -r '.manifests[0].digest' "${RUNNER_TEMP}/ours/index.json")" >> "${GITHUB_OUTPUT}"
 
+      # Also when the strict comparison failed: that is when the control build
+      # tells a reproducibility difference from a wrong patch.
       - name: "Control: build the extension without the fix"
-        if: ${{ inputs.control }}
+        if: ${{ !cancelled() && inputs.control && steps.build.outcome == 'success' }}
         continue-on-error: true
         working-directory: ext
         run: |
@@ -583,7 +653,7 @@ jobs:
             TARGET_ARGS="--tag=${EXTENSION_IMAGE}:control --output=type=oci,dest=${RUNNER_TEMP}/control,tar=false"
 
       - name: "Control: compare with the official image (report only)"
-        if: ${{ inputs.control }}
+        if: ${{ !cancelled() && inputs.control && steps.build.outcome == 'success' }}
         continue-on-error: true
         run: |
           {
