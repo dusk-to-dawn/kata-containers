@@ -1,0 +1,686 @@
+# Fork CI of dusk-to-dawn/kata-containers. It runs only when someone
+# dispatches it: nothing in this fork runs on push, pull request, schedule,
+# tag or release. Read .github/FORK-CI.md for the rules, the cost of each
+# entry point and the release steps.
+#
+# Inputs:
+#   ref        the full 40-character SHA of the commit to test: a commit of
+#              the branch this workflow is dispatched on, based on upstream
+#              4.3.1
+#   extension  none: the test job only; build: also build the Talos
+#              kata-containers extension with this fork's fix and compare it
+#              with the official image; push: also publish it
+#   control    also build the extension without the fix and report whether
+#              its shim is byte-identical to the official one (report only)
+#
+# Jobs:
+#   test       builds the shim at ref; runs the cpuset regression test as
+#              root, which must pass; reverses the fix outside the tests and
+#              runs it again, which must fail with the bug's error; runs the
+#              package's tests as root and as the runner user
+#   extension  builds the extension the way siderolabs/extensions v1.14.6
+#              does, with the fix added as a patch, and compares the image
+#              with the official one file by file
+#   publish    pushes the compared image, under a version that must not exist
+name: "Fork CI"
+run-name: "Fork CI ${{ inputs.extension }} ${{ inputs.ref }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Full 40-character SHA of the commit to test"
+        required: true
+        type: string
+      extension:
+        description: "none (tests only), build (also build and compare the extension), push (also publish it)"
+        required: true
+        default: "none"
+        type: choice
+        options:
+          - "none"
+          - "build"
+          - "push"
+      control:
+        description: "Also build the extension without the fix and report whether its shim matches the official one"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# One run at a time, and never cancelled halfway through a push.
+concurrency:
+  group: "fork-ci"
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Upstream's tag 4.3.1, the base of this fork's fix.
+  BASE_COMMIT: "03cf2ec06a5d302f23af811744f6bcea49988bfb"
+  # The fix's regression test, and a string that only a shim with the fix holds.
+  REGRESSION_TEST: "TestUpdateCpuSetEnablesCpusetController"
+  FIX_MARKER: "failed to enable the cpuset controller"
+  # The extension this fork publishes. Bump the version for every new patch.
+  EXTENSION_IMAGE: "ghcr.io/dusk-to-dawn/kata-containers"
+  EXTENSION_VERSION: "4.3.1-fix.1"
+  # siderolabs/extensions at tag v1.14.6, and the kata-containers image that
+  # Talos v1.14.6 lists: an index, and its linux/amd64 manifest.
+  SIDERO_EXTENSIONS_COMMIT: "47dfc5ac03b5164384d401fb69109944e24362d3"
+  SIDERO_EXTENSIONS_TAG: "v1.14.6"
+  OFFICIAL_IMAGE: "ghcr.io/siderolabs/kata-containers@sha256:dfd94e726b0ca516c198881c296d2f2fbce75ceb97244f3c1bdbba065bafd23e"
+  OFFICIAL_AMD64_MANIFEST: "sha256:fb31f84fb60a74fb96a20cdd24078350c25a8e29e780cce638e04599ff431d18"
+  BUILDKIT_IMAGE: "moby/buildkit:buildx-stable-1@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe"
+  # Use the Go that setup-go installs, never download another one.
+  GOTOOLCHAIN: "local"
+
+jobs:
+  test:
+    name: "test: shim build and cpuset regression test"
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 20
+    steps:
+      - name: "Check the repository and the inputs"
+        env:
+          REF: ${{ inputs.ref }}
+          EXTENSION: ${{ inputs.extension }}
+          CONTROL: ${{ inputs.control }}
+        run: |
+          if [[ "${GITHUB_REPOSITORY}" != "dusk-to-dawn/kata-containers" ]]; then
+            echo "::error::this workflow belongs to dusk-to-dawn/kata-containers, not ${GITHUB_REPOSITORY}"
+            exit 1
+          fi
+          if [[ ! "${REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::ref must be a full 40-character lowercase commit SHA"
+            exit 1
+          fi
+          if [[ ! "${EXTENSION}" =~ ^(none|build|push)$ ]]; then
+            echo "::error::extension must be none, build or push"
+            exit 1
+          fi
+          if [[ ! "${CONTROL}" =~ ^(true|false)$ ]]; then
+            echo "::error::control must be true or false"
+            exit 1
+          fi
+          if [[ ! "${EXTENSION_VERSION}" =~ ^4\.3\.1-fix\.[0-9]+$ ]]; then
+            echo "::error::EXTENSION_VERSION must look like 4.3.1-fix.<n>"
+            exit 1
+          fi
+          {
+            echo "### Fork CI \`${EXTENSION}\` for \`${REF}\`"
+            echo
+            echo "Workflow from \`${GITHUB_REF_NAME}\` at \`${GITHUB_SHA}\`, control build: ${CONTROL}."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          filter: "blob:none"
+          persist-credentials: false
+
+      - name: "Check that ref is on the dispatched branch and based on 4.3.1"
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "${REF}" ]]; then
+            echo "::error::the checkout is not at ref"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${REF}" "${GITHUB_SHA}"; then
+            echo "::error::ref is not in the history of ${GITHUB_REF_NAME} (${GITHUB_SHA})"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${BASE_COMMIT}" "${REF}"; then
+            echo "::error::ref is not based on upstream 4.3.1 (${BASE_COMMIT})"
+            exit 1
+          fi
+          git log --oneline "${BASE_COMMIT}..${REF}"
+          git diff --stat "${BASE_COMMIT}" "${REF}" -- src/
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "src/runtime/go.mod"
+          cache: false
+
+      - name: "Build the shim"
+        run: |
+          go version
+          make -C src/runtime SKIP_GO_VERSION_CHECK=y containerd-shim-v2
+          src/runtime/containerd-shim-kata-v2 --version
+          {
+            echo
+            echo "Shim built from ref: \`$(sha256sum src/runtime/containerd-shim-kata-v2 | cut -d' ' -f1)\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: "Check for cgroup v2 and root"
+        run: |
+          uname -r
+          echo "root cgroup.controllers: $(cat /sys/fs/cgroup/cgroup.controllers)"
+          echo "root cgroup.subtree_control: $(cat /sys/fs/cgroup/cgroup.subtree_control)"
+          if [[ "$(stat -fc %T /sys/fs/cgroup)" != "cgroup2fs" ]]; then
+            echo "::error::/sys/fs/cgroup is not cgroup v2"
+            exit 1
+          fi
+          sudo -n true
+
+      - name: "Build the package's tests with the fix"
+        working-directory: src/runtime
+        run: go test -c -o "${RUNNER_TEMP}/resourcecontrol-fixed.test" ./pkg/resourcecontrol/
+
+      - name: "Run the regression test as root: it must pass"
+        working-directory: src/runtime/pkg/resourcecontrol
+        run: |
+          log="${RUNNER_TEMP}/regression-fixed.log"
+          status=0
+          sudo "${RUNNER_TEMP}/resourcecontrol-fixed.test" -test.run "^${REGRESSION_TEST}\$" -test.v -test.count=1 2>&1 | tee "${log}" || status=$?
+          if [[ "${status}" -ne 0 ]]; then
+            echo "::error::the regression test failed with the fix"
+            exit 1
+          fi
+          if grep -q -- "--- SKIP" "${log}"; then
+            echo "::error::the regression test was skipped"
+            exit 1
+          fi
+          for t in "${REGRESSION_TEST}" "${REGRESSION_TEST}/cpus" "${REGRESSION_TEST}/mems"; do
+            if ! grep -Eq -- "--- PASS: ${t} \(" "${log}"; then
+              echo "::error::${t} did not pass"
+              exit 1
+            fi
+          done
+          echo "Regression test with the fix: passed." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: "Reverse the fix outside the tests and run the regression test again: it must fail"
+        run: |
+          log="${RUNNER_TEMP}/regression-reverted.log"
+          git diff --no-ext-diff --binary "${BASE_COMMIT}" HEAD -- src ':(exclude)*_test.go' > "${RUNNER_TEMP}/fix-without-tests.diff"
+          if [[ ! -s "${RUNNER_TEMP}/fix-without-tests.diff" ]]; then
+            echo "::error::ref changes nothing in src/ outside the tests"
+            exit 1
+          fi
+          git apply -R "${RUNNER_TEMP}/fix-without-tests.diff"
+          git status --short
+          if ! git diff --quiet "${BASE_COMMIT}" -- src ':(exclude)*_test.go'; then
+            echo "::error::src/ outside the tests does not match 4.3.1 after the reversal"
+            exit 1
+          fi
+          if ! git diff --quiet HEAD -- '*_test.go'; then
+            echo "::error::the reversal changed a test"
+            exit 1
+          fi
+          (cd src/runtime && go test -c -o "${RUNNER_TEMP}/resourcecontrol-reverted.test" ./pkg/resourcecontrol/)
+          status=0
+          (cd src/runtime/pkg/resourcecontrol && sudo "${RUNNER_TEMP}/resourcecontrol-reverted.test" -test.run "^${REGRESSION_TEST}\$" -test.v -test.count=1) 2>&1 | tee "${log}" || status=$?
+          git checkout -- src
+          git clean -fdq -- src
+          if [[ -n "$(git status --porcelain -- src)" ]]; then
+            echo "::error::the tree was not restored after the reversal"
+            exit 1
+          fi
+          if [[ "${status}" -eq 0 ]]; then
+            echo "::error::the regression test passed without the fix, so it does not detect the bug"
+            exit 1
+          fi
+          if grep -q -- "--- SKIP" "${log}"; then
+            echo "::error::the regression test was skipped without the fix"
+            exit 1
+          fi
+          for t in "${REGRESSION_TEST}/cpus" "${REGRESSION_TEST}/mems"; do
+            if ! grep -Eq -- "--- FAIL: ${t} \(" "${log}"; then
+              echo "::error::${t} did not fail without the fix"
+              exit 1
+            fi
+          done
+          for f in cpus mems; do
+            if ! grep -Eq "/kata_sandbox/cpuset\.${f}: permission denied" "${log}"; then
+              echo "::error::without the fix, the test did not fail with the bug's error on cpuset.${f}"
+              exit 1
+            fi
+          done
+          echo "Regression test without the fix: failed with \`cpuset.cpus: permission denied\` and \`cpuset.mems: permission denied\`, as it must." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: "Run the package's tests as root and as the runner user"
+        run: |
+          (cd src/runtime/pkg/resourcecontrol && sudo "${RUNNER_TEMP}/resourcecontrol-fixed.test" -test.v -test.count=1)
+          (cd src/runtime && go test -count=1 -v ./pkg/resourcecontrol/)
+          leftover=$(find /sys/fs/cgroup -maxdepth 1 -name 'kata-tests-cpuset-*')
+          if [[ -n "${leftover}" ]]; then
+            echo "::error::the tests left cgroups behind: ${leftover}"
+            exit 1
+          fi
+          echo "Package tests as root and as the runner user: passed." >> "${GITHUB_STEP_SUMMARY}"
+
+  extension:
+    name: "extension: build and compare with the official image"
+    needs: test
+    if: ${{ inputs.extension == 'build' || inputs.extension == 'push' }}
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 45
+    outputs:
+      digest: ${{ steps.compare.outputs.digest }}
+    steps:
+      - name: "Check the tools"
+        run: |
+          for t in docker git jq make python3 skopeo; do
+            if ! command -v "${t}" > /dev/null; then
+              echo "::error::${t} is not installed on this runner"
+              exit 1
+            fi
+          done
+          docker version --format '{{.Server.Version}}'
+          docker buildx version
+          skopeo --version
+          python3 --version
+
+      - name: "Check out this fork at ref"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          path: "kata"
+          fetch-depth: 0
+          filter: "blob:none"
+          persist-credentials: false
+
+      - name: "Check out siderolabs/extensions at v1.14.6"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: "siderolabs/extensions"
+          ref: ${{ env.SIDERO_EXTENSIONS_COMMIT }}
+          path: "ext"
+          fetch-depth: 0
+          filter: "blob:none"
+          persist-credentials: false
+
+      - name: "Check the checkouts"
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          if [[ "$(git -C kata rev-parse HEAD)" != "${REF}" ]] || ! git -C kata merge-base --is-ancestor "${BASE_COMMIT}" "${REF}"; then
+            echo "::error::the fork's checkout is not at ref, or ref is not based on 4.3.1"
+            exit 1
+          fi
+          if [[ "$(git -C ext rev-parse HEAD)" != "${SIDERO_EXTENSIONS_COMMIT}" ]]; then
+            echo "::error::siderolabs/extensions is not at ${SIDERO_EXTENSIONS_COMMIT}"
+            exit 1
+          fi
+          if [[ "$(git -C ext rev-parse "refs/tags/${SIDERO_EXTENSIONS_TAG}^{commit}")" != "${SIDERO_EXTENSIONS_COMMIT}" ]]; then
+            echo "::error::tag ${SIDERO_EXTENSIONS_TAG} of siderolabs/extensions is not ${SIDERO_EXTENSIONS_COMMIT}"
+            exit 1
+          fi
+          if [[ -n "$(git -C ext status --porcelain)" ]]; then
+            echo "::error::the siderolabs/extensions checkout is not clean"
+            exit 1
+          fi
+
+      - name: "Add the fix to the kata-containers recipe"
+        run: |
+          recipe=ext/container-runtime/kata-containers
+          mkdir -p "${recipe}/patches" "${RUNNER_TEMP}/comparison"
+          git -C kata diff --no-color --no-ext-diff "${BASE_COMMIT}" HEAD -- src/ > "${recipe}/patches/dusk-to-dawn-fixes.patch"
+          if [[ ! -s "${recipe}/patches/dusk-to-dawn-fixes.patch" ]]; then
+            echo "::error::ref changes nothing in src/"
+            exit 1
+          fi
+          python3 -I - "${recipe}" <<'EOF'
+          import os
+          import sys
+
+          recipe = sys.argv[1]
+
+
+          def edit(name, old, new):
+              path = os.path.join(recipe, name)
+              with open(path) as f:
+                  text = f.read()
+              if text.count(old) != 1:
+                  sys.exit(f"{path}: expected exactly one {old!r}")
+              with open(path, "w") as f:
+                  f.write(text.replace(old, new))
+
+
+          tree = "${GOPATH}/src/github.com/kata-containers"
+          untar = f"        tar -xzf kata-containers.tar.gz --strip-components=1 -C {tree}\n"
+          patch = f"        patch -p1 -d {tree} < /pkg/patches/dusk-to-dawn-fixes.patch\n"
+          edit("pkg.yaml", untar, untar + patch)
+          edit("vars.yaml", 'VERSION: "{{ .KATA_CONTAINERS_VERSION }}"\n', f'VERSION: "{os.environ["EXTENSION_VERSION"]}"\n')
+          EOF
+          git -C ext diff | tee "${RUNNER_TEMP}/comparison/recipe.diff"
+          git -C ext status --short
+          cp "${recipe}/patches/dusk-to-dawn-fixes.patch" "${RUNNER_TEMP}/comparison/"
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: "Build the extension with the fix (linux/amd64)"
+        working-directory: ext
+        run: |
+          make docker-kata-containers PLATFORM=linux/amd64 PROGRESS=plain \
+            TARGET_ARGS="--tag=${EXTENSION_IMAGE}:${EXTENSION_VERSION} --output=type=oci,dest=${RUNNER_TEMP}/ours,tar=false --metadata-file=${RUNNER_TEMP}/ours.metadata.json"
+          jq . "${RUNNER_TEMP}/ours.metadata.json"
+          jq . "${RUNNER_TEMP}/ours/index.json"
+
+      - name: "Fetch the official image"
+        run: |
+          skopeo copy --override-os linux --override-arch amd64 "docker://${OFFICIAL_IMAGE}" "oci:${RUNNER_TEMP}/official"
+          got=$(jq -r '.manifests[0].digest' "${RUNNER_TEMP}/official/index.json")
+          if [[ "${got}" != "${OFFICIAL_AMD64_MANIFEST}" ]]; then
+            echo "::error::the official linux/amd64 manifest is ${got}, expected ${OFFICIAL_AMD64_MANIFEST}"
+            exit 1
+          fi
+
+      - name: "Write the comparison tool"
+        run: |
+          cat > "${RUNNER_TEMP}/ocicmp.py" <<'EOF'
+          """Compare a candidate Talos extension image with the official one, file by file.
+
+          Usage: python3 -I ocicmp.py <official layout> <candidate layout> <out dir> <strict|report>
+
+          Both arguments are OCI image layouts holding one linux/amd64 image manifest.
+          Every blob is checked against its digest. Layers are applied in order, with
+          OCI whiteouts. Each file is listed with its type, mode and sha256 (or link
+          target) into <out dir>/{official,candidate}-files.tsv, and the differences
+          into <out dir>/comparison.md.
+
+          strict: fail unless the file lists are equal, the only files that differ are
+          the shim and the extension manifest, the shim differs, the candidate shim
+          holds FIX_MARKER and the official one does not, and the candidate manifest
+          equals the official one with metadata.version set to EXTENSION_VERSION.
+          report: write the same report and never fail on differences.
+          """
+          import gzip
+          import hashlib
+          import io
+          import json
+          import os
+          import sys
+          import tarfile
+
+          SHIM = "/rootfs/usr/local/bin/containerd-shim-kata-v2"
+          MANIFEST = "/manifest.yaml"
+
+
+          def blob(layout, digest):
+              algo, hexd = digest.split(":", 1)
+              if algo != "sha256" or len(hexd) != 64:
+                  sys.exit(f"unsupported digest {digest}")
+              with open(os.path.join(layout, "blobs", algo, hexd), "rb") as f:
+                  data = f.read()
+              if hashlib.sha256(data).hexdigest() != hexd:
+                  sys.exit(f"{layout}: blob {digest} does not match its digest")
+              return data
+
+
+          def load(layout):
+              """Return (manifest digest, {path: (type, mode, hash or target)}, {path: bytes} for SHIM and MANIFEST)."""
+              with open(os.path.join(layout, "index.json")) as f:
+                  index = json.load(f)
+              if len(index["manifests"]) != 1:
+                  sys.exit(f"{layout}: expected one manifest in index.json, found {len(index['manifests'])}")
+              desc = index["manifests"][0]
+              if desc.get("mediaType") != "application/vnd.oci.image.manifest.v1+json":
+                  sys.exit(f"{layout}: expected an OCI image manifest, found {desc.get('mediaType')}")
+              manifest = json.loads(blob(layout, desc["digest"]))
+              config = json.loads(blob(layout, manifest["config"]["digest"]))
+              if (config.get("os"), config.get("architecture")) != ("linux", "amd64"):
+                  sys.exit(f"{layout}: expected linux/amd64, found {config.get('os')}/{config.get('architecture')}")
+              files, keep = {}, {}
+              for layer in manifest["layers"]:
+                  data = blob(layout, layer["digest"])
+                  if layer["mediaType"].endswith("+gzip"):
+                      data = gzip.decompress(data)
+                  elif not layer["mediaType"].endswith(".tar"):
+                      sys.exit(f"{layout}: unsupported layer type {layer['mediaType']}")
+                  with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
+                      for m in tar:
+                          name = m.name[2:] if m.name.startswith("./") else m.name
+                          path = "/" + name.strip("/")
+                          if path == "/":
+                              continue
+                          parent, base = os.path.split(path)
+                          if base == ".wh..wh..opq":
+                              for p in [p for p in files if p.startswith(parent + "/")]:
+                                  del files[p]
+                              continue
+                          if base.startswith(".wh."):
+                              gone = os.path.join(parent, base[4:])
+                              for p in [p for p in files if p == gone or p.startswith(gone + "/")]:
+                                  del files[p]
+                              continue
+                          mode = f"{m.mode:04o}"
+                          if m.isreg():
+                              content = tar.extractfile(m).read()
+                              files[path] = ("file", mode, hashlib.sha256(content).hexdigest())
+                              if path in (SHIM, MANIFEST):
+                                  keep[path] = content
+                          elif m.isdir():
+                              files[path] = ("dir", mode, "-")
+                          elif m.issym():
+                              files[path] = ("symlink", mode, m.linkname)
+                          elif m.islnk():
+                              files[path] = ("hardlink", mode, m.linkname)
+                          else:
+                              files[path] = (f"type-{m.type!r}", mode, "-")
+              return desc["digest"], files, keep
+
+
+          def write_tsv(path, files):
+              with open(path, "w") as f:
+                  f.write("path\ttype\tmode\tsha256-or-target\n")
+                  for p in sorted(files):
+                      f.write("\t".join((p,) + files[p]) + "\n")
+
+
+          def main():
+              official_dir, candidate_dir, out, mode = sys.argv[1:5]
+              if mode not in ("strict", "report"):
+                  sys.exit(f"unknown mode {mode}")
+              os.makedirs(out, exist_ok=True)
+              od, of, ok = load(official_dir)
+              cd, cf, ck = load(candidate_dir)
+              write_tsv(os.path.join(out, "official-files.tsv"), of)
+              write_tsv(os.path.join(out, "candidate-files.tsv"), cf)
+
+              only_official = sorted(set(of) - set(cf))
+              only_candidate = sorted(set(cf) - set(of))
+              differ = sorted(p for p in set(of) & set(cf) if of[p] != cf[p])
+              shim_o = of.get(SHIM, ("", "", "missing"))[2]
+              shim_c = cf.get(SHIM, ("", "", "missing"))[2]
+
+              problems = []
+              if only_official or only_candidate:
+                  problems.append("the file lists differ")
+              unexpected = [p for p in differ if p not in (SHIM, MANIFEST)]
+              if unexpected:
+                  problems.append("files other than the shim and the manifest differ: " + ", ".join(unexpected))
+              if SHIM not in of or SHIM not in cf:
+                  problems.append("the shim is missing")
+              elif of[SHIM][:2] != cf[SHIM][:2]:
+                  problems.append("the shim's type or mode differs")
+              if shim_o == shim_c:
+                  problems.append("the shim does not differ")
+              marker = os.environ.get("FIX_MARKER", "").encode()
+              marker_o = marker in ok.get(SHIM, b"") if marker else None
+              marker_c = marker in ck.get(SHIM, b"") if marker else None
+              if not marker or marker_o or not marker_c:
+                  problems.append(f"fix marker {marker!r}: official has it: {marker_o}, candidate has it: {marker_c}")
+              version = os.environ.get("EXTENSION_VERSION", "")
+              want = ok.get(MANIFEST, b"").replace(b'\n  version: "4.3.1"\n', f'\n  version: "{version}"\n'.encode(), 1)
+              if not version or want == ok.get(MANIFEST) or ck.get(MANIFEST) != want:
+                  problems.append(f"the candidate manifest is not the official one with version {version!r}")
+
+              lines = [
+                  f"official manifest: `{od}`",
+                  f"candidate manifest: `{cd}`",
+                  "",
+                  f"official shim sha256: `{shim_o}`",
+                  f"candidate shim sha256: `{shim_c}`",
+                  f"shim identical: **{'yes' if shim_o == shim_c else 'no'}**",
+                  f"fix marker in official shim: {marker_o}, in candidate shim: {marker_c}",
+                  "",
+                  f"files: official {len(of)}, candidate {len(cf)}",
+                  f"only in official: {only_official or 'none'}",
+                  f"only in candidate: {only_candidate or 'none'}",
+                  "",
+                  "| differing path | official | candidate |",
+                  "|---|---|---|",
+              ]
+              for p in differ:
+                  lines.append(f"| `{p}` | {' '.join(of[p])} | {' '.join(cf[p])} |")
+              if not differ:
+                  lines.append("| none | | |")
+              lines.append("")
+              if mode == "strict":
+                  lines.append("result: " + ("**FAIL**: " + "; ".join(problems) if problems else "**pass**"))
+              else:
+                  lines.append("result: report only; strict-rule findings: " + ("; ".join(problems) or "none"))
+              report = "\n".join(lines) + "\n"
+              with open(os.path.join(out, "comparison.md"), "w") as f:
+                  f.write(report)
+              print(report)
+              if mode == "strict" and problems:
+                  sys.exit(1)
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: "Compare with the official image"
+        id: compare
+        run: |
+          status=0
+          python3 -I "${RUNNER_TEMP}/ocicmp.py" "${RUNNER_TEMP}/official" "${RUNNER_TEMP}/ours" "${RUNNER_TEMP}/comparison/fixed" strict || status=$?
+          {
+            echo
+            echo "### Extension \`${EXTENSION_IMAGE}:${EXTENSION_VERSION}\` against the official image"
+            echo
+            cat "${RUNNER_TEMP}/comparison/fixed/comparison.md"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [[ "${status}" -ne 0 ]]; then
+            echo "::error::the extension differs from the official image in an unexpected way"
+            exit 1
+          fi
+          echo "digest=$(jq -r '.manifests[0].digest' "${RUNNER_TEMP}/ours/index.json")" >> "${GITHUB_OUTPUT}"
+
+      - name: "Control: build the extension without the fix"
+        if: ${{ inputs.control }}
+        continue-on-error: true
+        working-directory: ext
+        run: |
+          git checkout -- .
+          git clean -fdxq -- container-runtime/kata-containers
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::the recipe was not restored"
+            exit 1
+          fi
+          make docker-kata-containers PLATFORM=linux/amd64 PROGRESS=plain \
+            TARGET_ARGS="--tag=${EXTENSION_IMAGE}:control --output=type=oci,dest=${RUNNER_TEMP}/control,tar=false"
+
+      - name: "Control: compare with the official image (report only)"
+        if: ${{ inputs.control }}
+        continue-on-error: true
+        run: |
+          {
+            echo
+            echo "### Control: the extension without the fix against the official image"
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [[ ! -f "${RUNNER_TEMP}/control/index.json" ]]; then
+            echo "The control build failed; see its step." >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+          python3 -I "${RUNNER_TEMP}/ocicmp.py" "${RUNNER_TEMP}/official" "${RUNNER_TEMP}/control" "${RUNNER_TEMP}/comparison/control" report
+          cat "${RUNNER_TEMP}/comparison/control/comparison.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: "Upload the comparison"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: "comparison"
+          path: ${{ runner.temp }}/comparison/
+          if-no-files-found: "warn"
+          retention-days: 30
+
+      - name: "Upload the image for the publish job"
+        if: ${{ inputs.extension == 'push' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: "extension-oci"
+          path: ${{ runner.temp }}/ours/
+          if-no-files-found: "error"
+          retention-days: 1
+
+  publish:
+    name: "publish: push the compared image"
+    needs: extension
+    if: ${{ inputs.extension == 'push' }}
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - name: "Download the compared image"
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: "extension-oci"
+          path: ${{ runner.temp }}/ours
+
+      - name: "Check that it is the image the extension job compared"
+        env:
+          DIGEST: ${{ needs.extension.outputs.digest }}
+        run: |
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::the extension job did not report a digest"
+            exit 1
+          fi
+          got=$(jq -r '.manifests[0].digest' "${RUNNER_TEMP}/ours/index.json")
+          blob=$(sha256sum "${RUNNER_TEMP}/ours/blobs/sha256/${DIGEST#sha256:}" | cut -d' ' -f1)
+          if [[ "${got}" != "${DIGEST}" || "sha256:${blob}" != "${DIGEST}" ]]; then
+            echo "::error::the downloaded image is not the one compared (${got})"
+            exit 1
+          fi
+
+      - name: "Log in to ghcr.io"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: printf '%s' "${GITHUB_TOKEN}" | skopeo login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: "Refuse to overwrite an existing version"
+        run: |
+          ref="${EXTENSION_IMAGE}:${EXTENSION_VERSION}"
+          if out=$(skopeo inspect --raw "docker://${ref}" 2>&1); then
+            echo "::error::${ref} exists already; bump EXTENSION_VERSION instead"
+            exit 1
+          fi
+          case "${out}" in
+            *"manifest unknown"*|*"MANIFEST_UNKNOWN"*|*"name unknown"*|*"NAME_UNKNOWN"*|*"not found"*) echo "${ref} does not exist yet" ;;
+            *) echo "::error::cannot tell whether ${ref} exists: ${out}"; exit 1 ;;
+          esac
+
+      - name: "Push"
+        env:
+          DIGEST: ${{ needs.extension.outputs.digest }}
+        run: |
+          ref="${EXTENSION_IMAGE}:${EXTENSION_VERSION}"
+          skopeo copy --preserve-digests --digestfile "${RUNNER_TEMP}/pushed.digest" "oci:${RUNNER_TEMP}/ours" "docker://${ref}"
+          pushed=$(cat "${RUNNER_TEMP}/pushed.digest")
+          remote="sha256:$(skopeo inspect --raw "docker://${EXTENSION_IMAGE}@${pushed}" | sha256sum | cut -d' ' -f1)"
+          if [[ "${pushed}" != "${DIGEST}" || "${remote}" != "${DIGEST}" ]]; then
+            echo "::error::pushed ${pushed}, registry has ${remote}, compared ${DIGEST}"
+            exit 1
+          fi
+          {
+            echo "### Published"
+            echo
+            echo "\`${ref}@${pushed}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: "Log out of ghcr.io"
+        if: ${{ always() }}
+        run: skopeo logout ghcr.io || true
