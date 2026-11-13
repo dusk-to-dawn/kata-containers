@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 
 	"github.com/containerd/cgroups/v3"
@@ -479,12 +480,50 @@ func (c *LinuxCgroup) UpdateCpuSet(cpuset, memset string) error {
 			CPU: c.cpusets,
 		})
 	case *cgroup2.Manager:
+		if err := c.enableCpusetController(cg); err != nil {
+			return err
+		}
 		return cg.Update(cgroup2.ToResources(&specs.LinuxResources{
 			CPU: c.cpusets,
 		}))
 	default:
 		return ErrCgroupMode
 	}
+}
+
+// enableCpusetController makes sure that the cpuset controller is enabled for
+// the cgroup v2 managed by cg before its cpuset.cpus or cpuset.mems is written.
+//
+// containerd/cgroups v3 enables cpuset in the parent's cgroup.subtree_control
+// only when a cgroup is created with cpus or mems. The sandbox cgroup is created
+// from the pause container's spec, which normally has neither, so its cpuset
+// files would not exist. Writing them would then fail with EACCES, because
+// cgroupfs cannot create files and the library opens them with O_CREAT.
+func (c *LinuxCgroup) enableCpusetController(cg *cgroup2.Manager) error {
+	if c.cpusets == nil || (c.cpusets.Cpus == "" && c.cpusets.Mems == "") {
+		return nil
+	}
+
+	controllers, err := cg.Controllers()
+	if err != nil {
+		return fmt.Errorf("failed to read the controllers of cgroup %s: %w", c.path, err)
+	}
+	if slices.Contains(controllers, "cpuset") {
+		return nil
+	}
+
+	// With systemd, the controllers of the parent are systemd's to manage.
+	if IsSystemdCgroup(c.path) {
+		return fmt.Errorf("the cpuset controller is not enabled for cgroup %s", c.path)
+	}
+
+	// This writes cgroup.subtree_control in every ancestor of the cgroup down to
+	// its parent, and returns the error of the parent's write only.
+	if err := cg.ToggleControllers([]string{"cpuset"}, cgroup2.Enable); err != nil {
+		return fmt.Errorf("failed to enable the cpuset controller for cgroup %s: %w", c.path, err)
+	}
+
+	return nil
 }
 
 func (c *LinuxCgroup) Type() ResourceControllerType {
