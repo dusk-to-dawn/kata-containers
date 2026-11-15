@@ -572,12 +572,12 @@ func TestClhCreateVMCoreScheduling(t *testing.T) {
 		},
 	}
 
+	cpus := map[string]chclient.CpusConfig{}
 	for _, d := range []struct {
 		mode string
 		want chclient.CoreSchedulingMode
 	}{
-		// Unset: the request is the client's, with its default.
-		{"", chclient.CORESCHEDULINGMODE_VM},
+		{"", chclient.NewCpusConfig(1, 1).GetCoreScheduling()},
 		{"Vm", chclient.CORESCHEDULINGMODE_VM},
 		{"Vcpu", chclient.CORESCHEDULINGMODE_VCPU},
 		{"Off", chclient.CORESCHEDULINGMODE_OFF},
@@ -591,13 +591,14 @@ func TestClhCreateVMCoreScheduling(t *testing.T) {
 		err = clh.CreateVM(context.Background(), "testSandbox", network, &config)
 		assert.NoError(err, msg)
 		assert.Equal(d.want, clh.vmconfig.Cpus.GetCoreScheduling(), msg)
-
-		if d.mode == "" {
-			want := chclient.NewCpusConfig(int32(config.NumVCPUs()), int32(config.DefaultMaxVCPUs))
-			want.SetNested(true)
-			assert.Equal(want, clh.vmconfig.Cpus, msg)
-		}
+		cpus[d.mode] = *clh.vmconfig.Cpus
 	}
+
+	// Unset, the request is the one upstream sends: the client's default
+	// mode, which is "Vm", and nothing else changed.
+	assert.Equal(chclient.CORESCHEDULINGMODE_VM, chclient.NewCpusConfig(1, 1).GetCoreScheduling())
+	assert.Equal(cpus["Vm"], cpus[""])
+	assert.NotEqual(cpus["Off"], cpus[""])
 }
 
 func TestClhRestoreVM(t *testing.T) {
