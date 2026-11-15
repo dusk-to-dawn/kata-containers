@@ -27,8 +27,10 @@ workflows inherited from upstream burnt about 1,900 job-minutes in a day.
   as root: it must pass, and neither it nor its subtests may be skipped. It
   then reverses the fix outside the tests in the working tree, and the test
   must fail with `cpuset.cpus: permission denied` and
-  `cpuset.mems: permission denied`, which shows it detects the bug. Last, it
-  runs the tests of `pkg/resourcecontrol` as root and as the runner user.
+  `cpuset.mems: permission denied`, which shows it detects the bug. It then
+  runs the tests of `pkg/resourcecontrol` as root and as the runner user. Last,
+  it runs the core scheduling setting's tests (`CORE_SCHEDULING_TESTS`) as
+  root: each must pass, and none may be skipped.
 - `preflight` (with `push`, beside `test`; at most 5 minutes): checks that
   `EXTENSION_VERSION` does not exist on ghcr.io yet, before anything is built.
   It has `packages: write`, like `publish`, so that the registry answers it
@@ -52,7 +54,8 @@ workflows inherited from upstream burnt about 1,900 job-minutes in a day.
   official image that Talos v1.14.6 lists,
   `ghcr.io/siderolabs/kata-containers:4.3.1@sha256:dfd94e72…`. The job fails
   unless the file lists are equal, only the shim and `manifest.yaml` differ,
-  the shim does differ, keeps its mode and owner and holds the fix, and the
+  the shim does differ, keeps its mode and owner and holds every string of
+  `FIX_MARKER` (one per change) that the official shim lacks, and the
   manifest differs only in its version. The comparison is uploaded as the
   artifact `comparison`. With `control`, the job also builds the recipe
   without the fix and reports whether that shim is byte-identical to the
@@ -100,9 +103,9 @@ the preflight; each earlier candidate adds 8.
 
 1. If the patch changed since the last release, bump `EXTENSION_VERSION` in
    `fork-ci.yaml` (`4.3.1-fix.<n+1>`). A published version is never reused.
-   A new fix also needs its own `FIX_MARKER`, a string that only the new code
-   puts into the shim, and it must stay under `src/runtime`, the only part
-   of `src/` the extension builds.
+   A new change also adds its own string to `FIX_MARKER` (`;`-separated), a
+   string that only the new code puts into the shim, and it must stay under
+   `src/runtime`, the only part of `src/` the extension builds.
 2. Run the local checks, then push `fixes-4.3.1`. Nothing runs.
 3. Dispatch Fork CI with `ref` = the full SHA of the branch's head and
    `extension: none`.

@@ -64,12 +64,16 @@ defaults:
 env:
   # Upstream's tag 4.3.1, the base of this fork's fix.
   BASE_COMMIT: "03cf2ec06a5d302f23af811744f6bcea49988bfb"
-  # The fix's regression test, and a string that only a shim with the fix holds.
+  # The cpuset fix's regression test, and the strings, separated by ";", that
+  # only a shim with this fork's changes holds: the cpuset fix's and the core
+  # scheduling setting's.
   REGRESSION_TEST: "TestUpdateCpuSetEnablesCpusetController"
-  FIX_MARKER: "failed to enable the cpuset controller"
+  FIX_MARKER: "failed to enable the cpuset controller;invalid core_scheduling"
+  # The core scheduling setting's tests, each run as root.
+  CORE_SCHEDULING_TESTS: "pkg/katautils:TestNewClhHypervisorConfig virtcontainers:TestClhCreateVMCoreScheduling virtcontainers:TestClhCreateVM virtcontainers:TestSandboxRestore"
   # The extension this fork publishes. Bump the version for every new patch.
   EXTENSION_IMAGE: "ghcr.io/dusk-to-dawn/kata-containers"
-  EXTENSION_VERSION: "4.3.1-fix.1"
+  EXTENSION_VERSION: "4.3.1-fix.2"
   # siderolabs/extensions at tag v1.14.6, and the kata-containers image that
   # Talos v1.14.6 lists: an index, and its linux/amd64 manifest.
   SIDERO_EXTENSIONS_COMMIT: "47dfc5ac03b5164384d401fb69109944e24362d3"
@@ -262,6 +266,28 @@ jobs:
             exit 1
           fi
           echo "Package tests as root and as the runner user: passed." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: "Run the core scheduling setting's tests as root: each must pass, none may be skipped"
+        working-directory: src/runtime
+        run: |
+          for entry in ${CORE_SCHEDULING_TESTS}; do
+            pkg="${entry%%:*}"
+            test="${entry#*:}"
+            bin="${RUNNER_TEMP}/$(basename "${pkg}").test"
+            [[ -x "${bin}" ]] || go test -c -o "${bin}" "./${pkg}/"
+            log="${RUNNER_TEMP}/${test}.log"
+            status=0
+            (cd "${pkg}" && sudo "${bin}" -test.run "^${test}\$" -test.v -test.count=1) 2>&1 | tee "${log}" || status=$?
+            if [[ "${status}" -ne 0 ]] || ! grep -Eq -- "--- PASS: ${test} \(" "${log}"; then
+              echo "::error::${pkg} ${test} did not pass"
+              exit 1
+            fi
+            if grep -q -- "--- SKIP" "${log}"; then
+              echo "::error::${pkg} ${test} was skipped"
+              exit 1
+            fi
+          done
+          echo "Core scheduling setting's tests as root: passed." >> "${GITHUB_STEP_SUMMARY}"
 
   preflight:
     name: "preflight: the version is free on ghcr.io"
@@ -572,11 +598,11 @@ jobs:
                   problems.append("the shim's type, mode or ownership differs")
               if shim_o == shim_c:
                   problems.append("the shim does not differ")
-              marker = os.environ.get("FIX_MARKER", "").encode()
-              marker_o = marker in ok.get(SHIM, b"") if marker else None
-              marker_c = marker in ck.get(SHIM, b"") if marker else None
-              if not marker or marker_o or not marker_c:
-                  problems.append(f"fix marker {marker!r}: official has it: {marker_o}, candidate has it: {marker_c}")
+              markers = [m.encode() for m in os.environ.get("FIX_MARKER", "").split(";") if m]
+              marker_o = {m.decode(): m in ok.get(SHIM, b"") for m in markers}
+              marker_c = {m.decode(): m in ck.get(SHIM, b"") for m in markers}
+              if not markers or any(marker_o.values()) or not all(marker_c.values()):
+                  problems.append(f"fix markers: official has them: {marker_o}, candidate has them: {marker_c}")
               version = os.environ.get("EXTENSION_VERSION", "")
               want = ok.get(MANIFEST, b"").replace(b'\n  version: "4.3.1"\n', f'\n  version: "{version}"\n'.encode(), 1)
               if not version or want == ok.get(MANIFEST) or ck.get(MANIFEST) != want:
@@ -589,7 +615,7 @@ jobs:
                   f"official shim sha256: `{shim_o}`",
                   f"candidate shim sha256: `{shim_c}`",
                   f"shim identical: **{'yes' if shim_o == shim_c else 'no'}**",
-                  f"fix marker in official shim: {marker_o}, in candidate shim: {marker_c}",
+                  f"fix markers in official shim: {marker_o}, in candidate shim: {marker_c}",
                   "",
                   f"files: official {len(of)}, candidate {len(cf)}",
                   f"only in official: {only_official or 'none'}",
