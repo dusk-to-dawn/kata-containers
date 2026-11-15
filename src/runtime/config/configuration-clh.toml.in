@@ -97,6 +97,14 @@ default_maxvcpus = @DEFMAXVCPUS@
 # Disable nested virtualization in the guest.
 disable_nested_virtualization = @DEFDISABLENESTEDVIRTUALIZATION_CLH@
 
+# Core scheduling of the guest's vCPU threads: "Vm" (one core scheduling cookie
+# for all of a VM's vCPU threads), "Vcpu" (one per vCPU thread) or "Off".
+# "Off" lets the vCPUs share a core with any other thread, the VM's own
+# virtiofsd included, and gives up the protection core scheduling gives against
+# side channels between threads of one core (such as MDS and L1TF).
+# Unset, Cloud Hypervisor's default applies ("Vm").
+#core_scheduling = "Vm"
+
 # Default memory size in MiB for SB/VM.
 # If unspecified then it will be set @DEFMEMSZ@ MiB.
 default_memory = @DEFMEMSZ@

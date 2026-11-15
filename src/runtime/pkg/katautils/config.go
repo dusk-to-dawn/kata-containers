@@ -24,6 +24,7 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/oci"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
+	chclient "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/cloud-hypervisor/client"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 	"github.com/pbnjay/memory"
@@ -160,6 +161,7 @@ type hypervisor struct {
 	Debug                          bool                      `toml:"enable_debug"`
 	DisableNestingChecks           bool                      `toml:"disable_nesting_checks"`
 	DisableNestedVirtualization    bool                      `toml:"disable_nested_virtualization"`
+	CoreScheduling                 string                    `toml:"core_scheduling"`
 	EnableIOThreads                bool                      `toml:"enable_iothreads"`
 	IndepIOThreads                 uint32                    `toml:"indep_iothreads"`
 	DisableImageNvdimm             bool                      `toml:"disable_image_nvdimm"`
@@ -434,6 +436,22 @@ func (h hypervisor) qgsPort() uint32 {
 	// TOML parser guarantees that only integers >= 0 are accepted. Any
 	// value from the parser is OK, including 0.
 	return h.QgsPort
+}
+
+// coreScheduling returns Cloud Hypervisor's core scheduling mode, or "" when
+// the configuration does not set one, which keeps Cloud Hypervisor's default.
+// Only the values of Cloud Hypervisor's API are accepted.
+func (h hypervisor) coreScheduling() (string, error) {
+	if h.CoreScheduling == "" {
+		return "", nil
+	}
+
+	if !chclient.CoreSchedulingMode(h.CoreScheduling).IsValid() {
+		return "", fmt.Errorf("invalid core_scheduling %q: valid values are %v",
+			h.CoreScheduling, chclient.AllowedCoreSchedulingModeEnumValues)
+	}
+
+	return h.CoreScheduling, nil
 }
 
 func (h hypervisor) GetEntropySource() string {
@@ -1238,6 +1256,11 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 			fmt.Errorf("Cloud Hypervisor does not support %s shared filesystem option", sharedFS)
 	}
 
+	coreScheduling, err := h.coreScheduling()
+	if err != nil {
+		return vc.HypervisorConfig{}, err
+	}
+
 	if (sharedFS == config.VirtioFS || sharedFS == config.VirtioFSNydus) && h.VirtioFSDaemon == "" {
 		return vc.HypervisorConfig{},
 			fmt.Errorf("cannot enable %s without daemon path in configuration file", sharedFS)
@@ -1258,6 +1281,7 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		NumVCPUsF:                      h.defaultVCPUs(),
 		DefaultMaxVCPUs:                h.defaultMaxVCPUs(),
 		DisableNestedVirtualization:    h.DisableNestedVirtualization,
+		CoreScheduling:                 coreScheduling,
 		MemorySize:                     h.defaultMemSz(),
 		MemSlots:                       h.defaultMemSlots(),
 		MemOffset:                      h.defaultMemOffset(),

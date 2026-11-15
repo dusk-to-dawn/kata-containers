@@ -556,6 +556,50 @@ func TestClhCreateVM(t *testing.T) {
 	}
 }
 
+func TestClhCreateVMCoreScheduling(t *testing.T) {
+	assert := assert.New(t)
+
+	store, err := persist.GetDriver()
+	assert.NoError(err)
+
+	network, err := NewNetwork()
+	assert.NoError(err)
+
+	clh := &cloudHypervisor{
+		config: HypervisorConfig{
+			VMStorePath:  store.RunVMStoragePath(),
+			RunStorePath: store.RunStoragePath(),
+		},
+	}
+
+	for _, d := range []struct {
+		mode string
+		want chclient.CoreSchedulingMode
+	}{
+		// Unset: the request is the client's, with its default.
+		{"", chclient.CORESCHEDULINGMODE_VM},
+		{"Vm", chclient.CORESCHEDULINGMODE_VM},
+		{"Vcpu", chclient.CORESCHEDULINGMODE_VCPU},
+		{"Off", chclient.CORESCHEDULINGMODE_OFF},
+	} {
+		msg := fmt.Sprintf("core scheduling %q", d.mode)
+
+		config, err := newClhConfig()
+		assert.NoError(err, msg)
+		config.CoreScheduling = d.mode
+
+		err = clh.CreateVM(context.Background(), "testSandbox", network, &config)
+		assert.NoError(err, msg)
+		assert.Equal(d.want, clh.vmconfig.Cpus.GetCoreScheduling(), msg)
+
+		if d.mode == "" {
+			want := chclient.NewCpusConfig(int32(config.NumVCPUs()), int32(config.DefaultMaxVCPUs))
+			want.SetNested(true)
+			assert.Equal(want, clh.vmconfig.Cpus, msg)
+		}
+	}
+}
+
 func TestClhRestoreVM(t *testing.T) {
 	assert := assert.New(t)
 

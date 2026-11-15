@@ -648,6 +648,11 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 
 	clh.vmconfig.Cpus.SetNested(!clh.config.DisableNestedVirtualization)
 
+	// Without a configured mode the request keeps the client's default.
+	if clh.config.CoreScheduling != "" {
+		clh.vmconfig.Cpus.SetCoreScheduling(chclient.CoreSchedulingMode(clh.config.CoreScheduling))
+	}
+
 	disableNvdimm := true
 	enableDax := false
 

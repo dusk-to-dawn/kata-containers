@@ -24,6 +24,7 @@ func TestSandboxRestore(t *testing.T) {
 		ID: "test-exp",
 		HypervisorConfig: HypervisorConfig{
 			DisableNestedVirtualization: true,
+			CoreScheduling:              "Off",
 		},
 	}
 	container := make(map[string]*Container)
@@ -59,6 +60,7 @@ func TestSandboxRestore(t *testing.T) {
 	restoredConfig, err := loadSandboxConfig(sandbox.id)
 	if assert.NoError(err) {
 		assert.True(restoredConfig.HypervisorConfig.DisableNestedVirtualization)
+		assert.Equal("Off", restoredConfig.HypervisorConfig.CoreScheduling)
 	}
 
 	err = sandbox.Restore()

@@ -980,6 +980,20 @@ func TestNewClhHypervisorConfig(t *testing.T) {
 	config, err = newClhHypervisorConfig(hypervisor)
 	assert.NoError(err)
 	assert.True(config.DisableNestedVirtualization)
+
+	// Unset, core scheduling is left to Cloud Hypervisor's default.
+	assert.Empty(config.CoreScheduling)
+	for _, mode := range []string{"Vm", "Vcpu", "Off"} {
+		hypervisor.CoreScheduling = mode
+		config, err = newClhHypervisorConfig(hypervisor)
+		assert.NoError(err, mode)
+		assert.Equal(mode, config.CoreScheduling)
+	}
+	for _, mode := range []string{"off", "vm", "None", " Off"} {
+		hypervisor.CoreScheduling = mode
+		_, err = newClhHypervisorConfig(hypervisor)
+		assert.ErrorContains(err, "invalid core_scheduling", mode)
+	}
 }
 
 func TestHypervisorDefaults(t *testing.T) {

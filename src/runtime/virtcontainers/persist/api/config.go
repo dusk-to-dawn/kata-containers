@@ -190,6 +190,10 @@ type HypervisorConfig struct {
 	// DisableNestedVirtualization disables nested virtualization in Cloud Hypervisor guests.
 	DisableNestedVirtualization bool
 
+	// CoreScheduling is Cloud Hypervisor's core scheduling mode for the
+	// guest's vCPU threads. Empty keeps Cloud Hypervisor's default.
+	CoreScheduling string
+
 	// DisableImageNvdimm disables nvdimm for guest rootfs image
 	DisableImageNvdimm bool
 
